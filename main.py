@@ -48,7 +48,7 @@ except ImportError:
 # =====================================================================================
 APP_NAME     = "Allowance Management"
 APP_TAGLINE  = "Smart Personal Finance Manager"
-APP_VERSION  = "1.1.0"
+APP_VERSION  = "1.5.1"
 DEVELOPER    = "RM LLAGAS"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1580,13 +1580,6 @@ SETTINGS_HTML = """
 {% extends "base.html" %}
 {% block title %}Settings{% endblock %}
 """ + APP_SHELL_HEAD + """
-  <div class="glass card-app text-center">
-    {% if user.profile_pic %}<img src="{{ user.profile_pic }}" class="avatar" style="width:76px;height:76px;">
-    {% else %}<div class="avatar mx-auto" style="width:76px;height:76px;font-size:1.6rem;">{{ user.full_name[0]|upper }}</div>{% endif %}
-    <div class="fw-bold mt-2">{{ user.full_name }}</div>
-    <div class="text-lo" style="font-size:.78rem;">@{{ user.username }} · Joined {{ user.date_joined[:10] }}</div>
-  </div>
-
   <div class="glass card-app">
     <div class="section-title"><i class="bi bi-person-circle"></i> Profile Photo</div>
     <div class="d-flex align-items-center gap-3 mb-3">
