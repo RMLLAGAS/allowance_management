@@ -162,6 +162,8 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
     if "verification_expiry" not in existing_user_cols:
         c.execute("ALTER TABLE users ADD COLUMN verification_expiry TEXT")
+    if "bio" not in existing_user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN bio TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS savings_goals (
@@ -1585,7 +1587,14 @@ SETTINGS_HTML = """
     <div class="d-flex align-items-center gap-3 mb-3">
       {% if user.profile_pic %}<img src="{{ user.profile_pic }}" class="avatar" style="width:64px;height:64px;">
       {% else %}<div class="avatar" style="width:64px;height:64px;font-size:1.4rem;">{{ user.full_name[0]|upper }}</div>{% endif %}
-      <div class="text-lo" style="font-size:.76rem;">Current profile photo</div>
+      <div>
+        <div class="text-lo" style="font-size:.72rem;">@{{ user.username }} · Joined {{ user.date_joined[:10] }}</div>
+        {% if user.bio %}
+          <div class="text-hi mt-1" style="font-size:.8rem;">{{ user.bio }}</div>
+        {% else %}
+          <div class="text-lo mt-1" style="font-size:.76rem;">Current profile photo</div>
+        {% endif %}
+      </div>
     </div>
     <form method="POST" action="{{ url_for('update_picture') }}" enctype="multipart/form-data" id="profilePicForm">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1651,6 +1660,7 @@ SETTINGS_HTML = """
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="mb-3"><label class="form-label">FULL NAME</label><input type="text" name="full_name" class="form-control" value="{{ user.full_name }}" required></div>
       <div class="mb-3"><label class="form-label">USERNAME</label><input type="text" name="username" class="form-control" value="{{ user.username }}" required></div>
+      <div class="mb-3"><label class="form-label">BIO</label><textarea name="bio" class="form-control" rows="2" placeholder="Tell us a bit about yourself" maxlength="150">{{ user.bio or '' }}</textarea></div>
       <button type="submit" class="btn-ghost w-100 py-2" data-loading="Saving...">Save Profile</button>
     </form>
   </div>
@@ -2273,6 +2283,7 @@ def update_profile():
     db = get_db()
     full_name = sanitize(request.form.get("full_name"), 80)
     username = sanitize(request.form.get("username"), 20)
+    bio = sanitize(request.form.get("bio"), 150)
 
     if not full_name or not valid_username(username):
         flash("Please provide a valid name and username.", "danger")
@@ -2283,7 +2294,7 @@ def update_profile():
         flash("That username is already taken.", "danger")
         return redirect(url_for("settings"))
 
-    db.execute("UPDATE users SET full_name=?, username=? WHERE id=?", (full_name, username, session["user_id"]))
+    db.execute("UPDATE users SET full_name=?, username=?, bio=? WHERE id=?", (full_name, username, bio, session["user_id"]))
     db.commit()
     flash("Profile updated successfully.", "success")
     return redirect(url_for("settings"))
