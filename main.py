@@ -1837,6 +1837,7 @@ _ICON_APPLE_TOUCH_B64 = (
 @app.route("/manifest.json")
 def manifest():
     manifest_data = {
+        "id": "/",
         "name": APP_NAME,
         "short_name": APP_NAME,
         "description": APP_TAGLINE,
@@ -1846,6 +1847,7 @@ def manifest():
         "background_color": "#060f24",
         "theme_color": "#0b1d3a",
         "orientation": "portrait",
+        "categories": ["finance", "productivity", "lifestyle"],
         "icons": [
             {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
             {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
@@ -1856,13 +1858,48 @@ def manifest():
 
 @app.route("/sw.js")
 def service_worker():
-    # Minimal service worker — required by browsers/PWA-to-APK tools to consider the app
-    # "installable". It intentionally does no offline caching (this app needs a live
-    # connection to the database anyway), it just needs to exist and register cleanly.
+    # Service worker with real caching logic (required by PWABuilder's "add caching" check):
+    #   - Static assets (icons, manifest) are cache-first for speed on repeat visits/offline.
+    #   - Everything else (dashboard, login, API calls, etc.) is network-first, since this
+    #     app is session/DB-driven and must never serve stale financial data. The cache is
+    #     only used as a fallback if the network request fails (e.g. brief connectivity drop).
     js = (
-        "self.addEventListener('install', e => self.skipWaiting());\n"
-        "self.addEventListener('activate', e => self.clients.claim());\n"
-        "self.addEventListener('fetch', e => {});\n"
+        "const CACHE_NAME = 'allowance-static-v1';\n"
+        "const STATIC_ASSETS = ['/icon-192.png', '/icon-512.png', '/apple-touch-icon.png', '/manifest.json'];\n"
+        "\n"
+        "self.addEventListener('install', e => {\n"
+        "  self.skipWaiting();\n"
+        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS)).catch(() => {}));\n"
+        "});\n"
+        "\n"
+        "self.addEventListener('activate', e => {\n"
+        "  e.waitUntil(\n"
+        "    caches.keys().then(names => Promise.all(\n"
+        "      names.filter(n => n !== CACHE_NAME).map(n => caches.delete(n))\n"
+        "    )).then(() => self.clients.claim())\n"
+        "  );\n"
+        "});\n"
+        "\n"
+        "self.addEventListener('fetch', e => {\n"
+        "  const url = new URL(e.request.url);\n"
+        "  if (e.request.method !== 'GET') return;\n"
+        "\n"
+        "  if (STATIC_ASSETS.includes(url.pathname)) {\n"
+        "    // Cache-first for static assets\n"
+        "    e.respondWith(\n"
+        "      caches.match(e.request).then(cached => cached || fetch(e.request).then(res => {\n"
+        "        const clone = res.clone();\n"
+        "        caches.open(CACHE_NAME).then(cache => cache.put(e.request, clone));\n"
+        "        return res;\n"
+        "      }))\n"
+        "    );\n"
+        "  } else {\n"
+        "    // Network-first for everything else (live session/DB data)\n"
+        "    e.respondWith(\n"
+        "      fetch(e.request).catch(() => caches.match(e.request))\n"
+        "    );\n"
+        "  }\n"
+        "});\n"
     )
     return Response(js, mimetype="application/javascript")
 
