@@ -18,9 +18,9 @@ import io
 import json
 import sqlite3
 import secrets
-import smtplib
 import random
-from email.mime.text import MIMEText
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -72,11 +72,17 @@ app.config.update(
 CATEGORIES = ["Food", "School", "Transportation", "Bills", "Shopping", "Entertainment", "Others"]
 SOURCES_HINT = ["Parents", "Salary", "Allowance", "Gift", "Freelance", "Other"]
 
-# --- Email verification (Gmail SMTP) --------------------------------------------------
-SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
-EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+# --- Email verification (Resend HTTP API) --------------------------------------------
+# Render (and most free-tier hosts) block outbound SMTP ports (25/465/587), which is why
+# smtplib connections fail with "[Errno 101] Network is unreachable" even with correct
+# credentials. Resend's API is called over plain HTTPS (port 443), which is never blocked.
+# Get a free API key at https://resend.com (no credit card needed for the free tier).
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# onboarding@resend.dev is Resend's shared test sender — works immediately with zero setup,
+# but only delivers to the email address you signed up to Resend with. Once you verify your
+# own domain in the Resend dashboard, set EMAIL_FROM to something like noreply@yourdomain.com
+# to send to any address.
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "onboarding@resend.dev")
 VERIFICATION_CODE_MINUTES = 10
 
 # --- Login attempt limiter (in-memory, per-process) ---------------------------------
@@ -337,41 +343,50 @@ def generate_verification_code():
 
 
 def send_verification_email(to_email, full_name, code):
-    """Send the 6-digit verification code via Gmail SMTP (STARTTLS on port 587).
-    Returns True on success, False if sending failed (e.g. SMTP not configured)."""
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+    """Send the 6-digit verification code via the Resend HTTP API (HTTPS, port 443).
+    Returns True on success, False if sending failed (e.g. API key not configured)."""
+    if not RESEND_API_KEY:
         # Not configured — caller still lets the user reach the verify page
         # (useful for local/offline testing) but nothing gets sent.
-        print("[email] EMAIL_ADDRESS / EMAIL_APP_PASSWORD not set — skipping send. "
+        print("[email] RESEND_API_KEY not set — skipping send. "
               "Check your .env file (and that python-dotenv is installed).")
         return False
     try:
         subject = f"{APP_NAME} — Your verification code"
-        body = (
+        text_body = (
             f"Hi {full_name},\n\n"
             f"Your {APP_NAME} verification code is: {code}\n\n"
             f"This code expires in {VERIFICATION_CODE_MINUTES} minutes.\n"
             f"If you didn't request this, you can ignore this email.\n"
         )
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_ADDRESS
-        msg["To"] = to_email
+        payload = json.dumps({
+            "from": f"{APP_NAME} <{EMAIL_FROM}>",
+            "to": [to_email],
+            "subject": subject,
+            "text": text_body,
+        }).encode("utf-8")
 
-        # timeout=10 is critical here: some hosts (Render free tier included)
-        # block outbound SMTP ports at the network level, which without a
-        # timeout makes this call hang until the OS gives up (minutes), long
-        # enough to exceed gunicorn's worker timeout and get the worker killed
-        # mid-request — which can make the whole service look "down"/"Not
-        # Found" to visitors. Failing fast here keeps the app responsive.
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, [to_email], msg.as_string())
-        return True
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            print(f"[email] Resend API returned status {resp.status} for {to_email}")
+            return False
+    except urllib.error.HTTPError as exc:
+        # Printed to the server console/log so the real API error (bad key,
+        # unverified sender domain, etc.) is visible instead of failing silently.
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"[email] Resend API error sending to {to_email}: {exc.code} {detail}")
+        return False
     except Exception as exc:
-        # Printed to the server console/log so the real SMTP error (bad app
-        # password, blocked port, etc.) is visible instead of failing silently.
         print(f"[email] Failed to send verification email to {to_email}: {exc}")
         return False
 
@@ -1843,7 +1858,7 @@ def register():
             flash("Account created! Please check your email for a verification code.", "success")
         else:
             flash("Account created, but the verification email could not be sent. "
-                  "Check EMAIL_ADDRESS / EMAIL_APP_PASSWORD in your .env, or use Resend Code.", "warning")
+                  "Check RESEND_API_KEY in your .env, or use Resend Code.", "warning")
         return redirect(url_for("verify_email"))
 
     return render_template("register.html")
@@ -1918,8 +1933,8 @@ def resend_code():
     if sent_ok:
         flash("A new verification code has been sent to your email.", "success")
     else:
-        flash("Could not send the verification email. Check EMAIL_ADDRESS / EMAIL_APP_PASSWORD "
-              "in your .env (see server console for the exact SMTP error).", "warning")
+        flash("Could not send the verification email. Check RESEND_API_KEY "
+              "in your .env (see server console for the exact API error).", "warning")
     return redirect(url_for("verify_email"))
 
 
