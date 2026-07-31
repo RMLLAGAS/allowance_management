@@ -373,6 +373,10 @@ def send_verification_email(to_email, full_name, code):
             headers={
                 "Authorization": f"Bearer {RESEND_API_KEY}",
                 "Content-Type": "application/json",
+                # Cloudflare (which fronts api.resend.com) blocks the default
+                # "Python-urllib/x.x" User-Agent with a bare "error code: 1010".
+                # A normal-looking User-Agent avoids that block entirely.
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
