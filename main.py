@@ -228,8 +228,20 @@ def csrf_protect():
         token = session.get("_csrf_token")
         sent = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token")
         if not token or not sent or token != sent:
-            flash("Security check failed. Please try again.", "danger")
-            return redirect(request.referrer or url_for("login"))
+            flash("Security check failed (your session may have expired). Please try again.", "danger")
+            # Prefer sending the user back to the exact page they were on. request.referrer
+            # (the Referer header) is unreliable — many browsers/WebViews omit it — which was
+            # previously bouncing users all the way to /login and wiping in-progress forms like
+            # /register. request.path is more reliable, but only safe to reuse when that same
+            # path also accepts GET (most POST-only action endpoints, e.g. /settings/profile,
+            # don't and would 405). Fall back to referrer, then to a sensible default page.
+            if request.url_rule and "GET" in request.url_rule.methods:
+                target = request.path
+            elif request.referrer:
+                target = request.referrer
+            else:
+                target = url_for("dashboard") if "user_id" in session else url_for("login")
+            return redirect(target)
 
 
 @app.before_request
