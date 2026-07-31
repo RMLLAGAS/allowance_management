@@ -611,6 +611,13 @@ BASE_HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>{% block title %}{{ app_name }}{% endblock %} · {{ app_name }}</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💳</text></svg>">
+<link rel="manifest" href="{{ url_for('manifest') }}">
+<link rel="apple-touch-icon" href="{{ url_for('apple_touch_icon') }}">
+<meta name="theme-color" content="#0b1d3a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="{{ app_name }}">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -808,6 +815,12 @@ document.addEventListener('submit', function(e){
   const btn = form.querySelector('button[type="submit"]');
   if(btn && !btn.dataset.noSpin) setBtnLoading(btn, btn.dataset.loading || 'Processing...');
 });
+// ---------- PWA service worker registration (enables "Add to Home Screen" / APK packaging) ----------
+if('serviceWorker' in navigator){
+  window.addEventListener('load', function(){
+    navigator.serviceWorker.register('{{ url_for("service_worker") }}').catch(function(){});
+  });
+}
 </script>
 {% block extra_scripts %}{% endblock %}
 </body>
@@ -1800,6 +1813,76 @@ def inject_globals():
         "developer": DEVELOPER, "csrf_token": csrf_token, "user": current_user(),
         "categories": CATEGORIES, "sources": SOURCES_HINT,
     }
+
+
+# =====================================================================================
+# SECTION 6B — PWA / APK SUPPORT
+# =====================================================================================
+# Installable Progressive Web App support. This lets the app be installed as an icon on
+# a phone's home screen, and — combined with a free tool like https://www.pwabuilder.com
+# (paste the live URL in, no coding needed) — lets you generate a real downloadable .apk
+# that wraps this same live app. The icons below are generated once and embedded as
+# base64 so no separate image files or static/ folder are needed.
+_ICON_192_B64 = (
+    "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"
+)
+_ICON_512_B64 = (
+    "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"
+)
+_ICON_APPLE_TOUCH_B64 = (
+    "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"
+)
+
+
+@app.route("/manifest.json")
+def manifest():
+    manifest_data = {
+        "name": APP_NAME,
+        "short_name": APP_NAME,
+        "description": APP_TAGLINE,
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#060f24",
+        "theme_color": "#0b1d3a",
+        "orientation": "portrait",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    }
+    return Response(json.dumps(manifest_data), mimetype="application/manifest+json")
+
+
+@app.route("/sw.js")
+def service_worker():
+    # Minimal service worker — required by browsers/PWA-to-APK tools to consider the app
+    # "installable". It intentionally does no offline caching (this app needs a live
+    # connection to the database anyway), it just needs to exist and register cleanly.
+    js = (
+        "self.addEventListener('install', e => self.skipWaiting());\n"
+        "self.addEventListener('activate', e => self.clients.claim());\n"
+        "self.addEventListener('fetch', e => {});\n"
+    )
+    return Response(js, mimetype="application/javascript")
+
+
+@app.route("/icon-192.png")
+def icon_192():
+    import base64
+    return Response(base64.b64decode(_ICON_192_B64), mimetype="image/png")
+
+
+@app.route("/icon-512.png")
+def icon_512():
+    import base64
+    return Response(base64.b64decode(_ICON_512_B64), mimetype="image/png")
+
+
+@app.route("/apple-touch-icon.png")
+def apple_touch_icon():
+    import base64
+    return Response(base64.b64decode(_ICON_APPLE_TOUCH_B64), mimetype="image/png")
 
 
 # =====================================================================================
