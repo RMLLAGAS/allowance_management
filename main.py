@@ -72,17 +72,20 @@ app.config.update(
 CATEGORIES = ["Food", "School", "Transportation", "Bills", "Shopping", "Entertainment", "Others"]
 SOURCES_HINT = ["Parents", "Salary", "Allowance", "Gift", "Freelance", "Other"]
 
-# --- Email verification (Resend HTTP API) --------------------------------------------
+# --- Email verification (Brevo HTTP API) ----------------------------------------------
 # Render (and most free-tier hosts) block outbound SMTP ports (25/465/587), which is why
 # smtplib connections fail with "[Errno 101] Network is unreachable" even with correct
-# credentials. Resend's API is called over plain HTTPS (port 443), which is never blocked.
-# Get a free API key at https://resend.com (no credit card needed for the free tier).
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-# onboarding@resend.dev is Resend's shared test sender — works immediately with zero setup,
-# but only delivers to the email address you signed up to Resend with. Once you verify your
-# own domain in the Resend dashboard, set EMAIL_FROM to something like noreply@yourdomain.com
-# to send to any address.
-EMAIL_FROM = os.environ.get("EMAIL_FROM", "onboarding@resend.dev")
+# credentials. Brevo's API is called over plain HTTPS (port 443), which is never blocked.
+# Unlike most providers, Brevo does NOT require owning/verifying a domain — you only verify
+# one sender email address (click a link Brevo emails you), then you can send to ANY
+# recipient. Free tier: 300 emails/day, no credit card, no expiration.
+# 1. Sign up at https://brevo.com
+# 2. Settings -> Senders, Domains & Dedicated IPs -> Senders -> Add a Sender (verify by
+#    clicking the link Brevo sends to that email — e.g. use your own Gmail here)
+# 3. Settings -> SMTP & API -> API Keys -> Generate a new API key
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+# Must be the exact email address you verified as a Sender in Brevo (step 2 above).
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 VERIFICATION_CODE_MINUTES = 10
 
 # --- Login attempt limiter (in-memory, per-process) ---------------------------------
@@ -345,12 +348,12 @@ def generate_verification_code():
 
 
 def send_verification_email(to_email, full_name, code):
-    """Send the 6-digit verification code via the Resend HTTP API (HTTPS, port 443).
+    """Send the 6-digit verification code via the Brevo HTTP API (HTTPS, port 443).
     Returns True on success, False if sending failed (e.g. API key not configured)."""
-    if not RESEND_API_KEY:
+    if not BREVO_API_KEY or not EMAIL_FROM:
         # Not configured — caller still lets the user reach the verify page
         # (useful for local/offline testing) but nothing gets sent.
-        print("[email] RESEND_API_KEY not set — skipping send. "
+        print("[email] BREVO_API_KEY / EMAIL_FROM not set — skipping send. "
               "Check your .env file (and that python-dotenv is installed).")
         return False
     try:
@@ -362,35 +365,35 @@ def send_verification_email(to_email, full_name, code):
             f"If you didn't request this, you can ignore this email.\n"
         )
         payload = json.dumps({
-            "from": f"{APP_NAME} <{EMAIL_FROM}>",
-            "to": [to_email],
+            "sender": {"name": APP_NAME, "email": EMAIL_FROM},
+            "to": [{"email": to_email}],
             "subject": subject,
-            "text": text_body,
+            "textContent": text_body,
         }).encode("utf-8")
 
         req = urllib.request.Request(
-            "https://api.resend.com/emails",
+            "https://api.brevo.com/v3/smtp/email",
             data=payload,
             method="POST",
             headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "api-key": BREVO_API_KEY,
                 "Content-Type": "application/json",
-                # Cloudflare (which fronts api.resend.com) blocks the default
-                # "Python-urllib/x.x" User-Agent with a bare "error code: 1010".
-                # A normal-looking User-Agent avoids that block entirely.
+                "Accept": "application/json",
+                # Cloudflare/other WAFs in front of some APIs block the default
+                # "Python-urllib/x.x" User-Agent. A normal-looking one avoids that.
                 "User-Agent": f"{APP_NAME}/{APP_VERSION}",
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             if 200 <= resp.status < 300:
                 return True
-            print(f"[email] Resend API returned status {resp.status} for {to_email}")
+            print(f"[email] Brevo API returned status {resp.status} for {to_email}")
             return False
     except urllib.error.HTTPError as exc:
         # Printed to the server console/log so the real API error (bad key,
-        # unverified sender domain, etc.) is visible instead of failing silently.
+        # unverified sender email, etc.) is visible instead of failing silently.
         detail = exc.read().decode("utf-8", errors="replace")
-        print(f"[email] Resend API error sending to {to_email}: {exc.code} {detail}")
+        print(f"[email] Brevo API error sending to {to_email}: {exc.code} {detail}")
         return False
     except Exception as exc:
         print(f"[email] Failed to send verification email to {to_email}: {exc}")
@@ -1865,7 +1868,7 @@ def register():
             flash("Account created! Please check your email for a verification code.", "success")
         else:
             flash("Account created, but the verification email could not be sent. "
-                  "Check RESEND_API_KEY in your .env, or use Resend Code.", "warning")
+                  "Check BREVO_API_KEY / EMAIL_FROM in your .env, or use Resend Code.", "warning")
         return redirect(url_for("verify_email"))
 
     return render_template("register.html")
@@ -1940,7 +1943,7 @@ def resend_code():
     if sent_ok:
         flash("A new verification code has been sent to your email.", "success")
     else:
-        flash("Could not send the verification email. Check RESEND_API_KEY "
+        flash("Could not send the verification email. Check BREVO_API_KEY / EMAIL_FROM "
               "in your .env (see server console for the exact API error).", "warning")
     return redirect(url_for("verify_email"))
 
