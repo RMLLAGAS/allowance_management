@@ -358,7 +358,13 @@ def send_verification_email(to_email, full_name, code):
         msg["From"] = EMAIL_ADDRESS
         msg["To"] = to_email
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        # timeout=10 is critical here: some hosts (Render free tier included)
+        # block outbound SMTP ports at the network level, which without a
+        # timeout makes this call hang until the OS gives up (minutes), long
+        # enough to exceed gunicorn's worker timeout and get the worker killed
+        # mid-request — which can make the whole service look "down"/"Not
+        # Found" to visitors. Failing fast here keeps the app responsive.
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
             server.starttls()
             server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, [to_email], msg.as_string())
