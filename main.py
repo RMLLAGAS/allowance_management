@@ -1875,6 +1875,7 @@ def manifest():
         "background_color": "#060f24",
         "theme_color": "#0b1d3a",
         "orientation": "portrait",
+        "display_override": ["standalone", "minimal-ui", "browser"],
         "categories": ["finance", "productivity", "lifestyle"],
         "prefer_related_applications": False,
         "icons": [
