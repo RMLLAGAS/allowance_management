@@ -1409,6 +1409,7 @@ document.getElementById('receiptInput').addEventListener('change', function () {
 });
 </script>
 {% endblock %}
+"""
 
 # --- TRANSACTIONS -------------------------------------------------------------------------
 TRANSACTIONS_HTML = """
