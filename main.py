@@ -64,9 +64,9 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
-    # 6MB is enough for the base64-encoded profile/cover photos and receipts,
-    # which are the only file uploads this app handles.
-    MAX_CONTENT_LENGTH=6 * 1024 * 1024,
+    # 15MB allows raw uploads up to ~10MB before base64 encoding expands them.
+    # Receipts support JPG/JPEG/PNG/WEBP/GIF/HEIC up to 10 MB raw.
+    MAX_CONTENT_LENGTH=15 * 1024 * 1024,
 )
 
 CATEGORIES = ["Food", "School", "Transportation", "Bills", "Shopping", "Entertainment", "Others"]
@@ -209,6 +209,11 @@ def init_db():
         )
     """)
 
+    # --- Safe migration: add receipt column to existing transactions tables ---
+    existing_tx_cols = [r[1] for r in c.execute("PRAGMA table_info(transactions)").fetchall()]
+    if "receipt" not in existing_tx_cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN receipt TEXT")
+
     conn.commit()
     conn.close()
 
@@ -336,8 +341,14 @@ def parse_date(raw):
         return datetime.now().strftime("%Y-%m-%d")
 
 
-def encode_upload(file_storage, max_bytes=4 * 1024 * 1024, allowed=("png", "jpg", "jpeg", "gif", "webp")):
-    """Validate + base64-encode an uploaded image so it can live inside SQLite (no static/ folder)."""
+def encode_upload(file_storage, max_bytes=10 * 1024 * 1024,
+                  allowed=("png", "jpg", "jpeg", "gif", "webp", "heic")):
+    """Validate + base64-encode an uploaded image so it can live inside SQLite (no static/ folder).
+
+    Supports JPG, JPEG, PNG, WEBP, GIF, and HEIC (iPhone).
+    HEIC images are automatically converted to JPEG using ImageMagick (wand).
+    Maximum raw upload size is 10 MB.
+    """
     if not file_storage or not file_storage.filename:
         return None
     ext = file_storage.filename.rsplit(".", 1)[-1].lower()
@@ -346,9 +357,26 @@ def encode_upload(file_storage, max_bytes=4 * 1024 * 1024, allowed=("png", "jpg"
     data = file_storage.read()
     if len(data) > max_bytes:
         return None
-    import base64
-    mime = "image/" + ("jpeg" if ext == "jpg" else ext)
-    return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
+    import base64 as _base64
+    # --- HEIC → JPEG conversion via wand / ImageMagick ---
+    if ext == "heic":
+        try:
+            from wand.image import Image as WandImage
+            import io as _io
+            with WandImage(blob=data, format="heic") as img:
+                img.format = "jpeg"
+                img.auto_orient()          # respect EXIF orientation
+                jpeg_buf = _io.BytesIO()
+                img.save(file=jpeg_buf)
+                data = jpeg_buf.getvalue()
+            ext = "jpeg"
+        except Exception:
+            # If wand/ImageMagick is unavailable or conversion fails, reject gracefully
+            return None
+    mime_map = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png",
+                "gif": "gif", "webp": "webp"}
+    mime = "image/" + mime_map.get(ext, ext)
+    return f"data:{mime};base64,{_base64.b64encode(data).decode('utf-8')}"
 
 
 def valid_email(e):
@@ -1340,12 +1368,47 @@ ADD_EXPENSE_HTML = """
       </div>
       <div class="mb-3">
         <label class="form-label">RECEIPT (optional)</label>
-        <input type="file" name="receipt" class="form-control" accept="image/*">
+        <input type="file" name="receipt" id="receiptInput" class="form-control"
+               accept="image/jpeg,image/png,image/webp,image/gif,image/heic,.heic,.jpg,.jpeg,.png,.webp,.gif">
+        <div class="text-lo mt-1" style="font-size:.72rem;">
+          JPG · JPEG · PNG · WEBP · GIF · HEIC — max 10 MB
+        </div>
+        <div id="receiptPreviewWrap" style="display:none; margin-top:10px;">
+          <img id="receiptPreview" style="max-width:100%; max-height:200px; border-radius:10px; border:1px solid var(--glass-brd);" alt="Receipt preview">
+        </div>
       </div>
       <button type="submit" class="grad-btn w-100" data-loading="Saving...">Save Expense</button>
     </form>
   </div>
-""" + APP_SHELL_TAIL
+""" + APP_SHELL_TAIL + """
+{% block extra_scripts %}
+<script>
+document.getElementById('receiptInput').addEventListener('change', function () {
+  var file = this.files[0];
+  var wrap = document.getElementById('receiptPreviewWrap');
+  var img  = document.getElementById('receiptPreview');
+  if (!file) { wrap.style.display = 'none'; return; }
+  // HEIC files can't be previewed in the browser; show a placeholder message
+  var name = file.name.toLowerCase();
+  if (name.endsWith('.heic')) {
+    img.removeAttribute('src');
+    img.alt = 'HEIC image selected — will be converted on save';
+    img.style.display = 'none';
+    wrap.innerHTML = '<div class="text-lo" style="font-size:.8rem; padding:8px 0;">📷 HEIC image selected (' +
+      (file.size / 1024 / 1024).toFixed(2) + ' MB) — will be converted to JPEG on save.</div>';
+    wrap.style.display = 'block';
+    return;
+  }
+  var reader = new FileReader();
+  reader.onload = function (e) {
+    img.src = e.target.result;
+    img.style.display = 'block';
+    wrap.style.display = 'block';
+  };
+  reader.readAsDataURL(file);
+});
+</script>
+{% endblock %}
 
 # --- TRANSACTIONS -------------------------------------------------------------------------
 TRANSACTIONS_HTML = """
@@ -1391,6 +1454,11 @@ TRANSACTIONS_HTML = """
         <div class="flex-grow-1">
           <div class="fw-semibold" style="font-size:.88rem;">{{ t.category or t.type|capitalize }}</div>
           <div class="text-lo" style="font-size:.72rem;">{{ t.date }} {% if t.notes %}· {{ t.notes[:28] }}{% endif %}</div>
+          {% if t.receipt %}
+          <div class="mt-1">
+            <img src="{{ t.receipt }}" alt="Receipt" style="max-width:56px; max-height:56px; border-radius:6px; object-fit:cover; border:1px solid var(--glass-brd);">
+          </div>
+          {% endif %}
         </div>
         <div class="text-end">
           <div class="fw-bold" style="font-size:.9rem; color:{{ 'var(--success)' if t.type=='allowance' else 'var(--danger)' }}">
@@ -2333,7 +2401,21 @@ def add_expense():
         category = request.form.get("category") if request.form.get("category") in CATEGORIES else "Others"
         date = parse_date(request.form.get("date"))
         notes = sanitize(request.form.get("notes"), 300)
-        receipt = encode_upload(request.files.get("receipt"))
+
+        # --- Receipt upload handling ---
+        receipt_file = request.files.get("receipt")
+        receipt = None
+        if receipt_file and receipt_file.filename:
+            receipt = encode_upload(receipt_file)
+            if receipt is None:
+                # File was provided but rejected — tell the user why
+                ext = receipt_file.filename.rsplit(".", 1)[-1].lower() if "." in receipt_file.filename else ""
+                allowed_exts = ("jpg", "jpeg", "png", "webp", "gif", "heic")
+                if ext not in allowed_exts:
+                    flash(f"Receipt not saved: unsupported format '.{ext}'. "
+                          "Accepted formats: JPG, JPEG, PNG, WEBP, GIF, HEIC.", "warning")
+                else:
+                    flash("Receipt not saved: file is too large (max 10 MB).", "warning")
 
         if not amount:
             flash("Please enter a valid amount.", "danger")
