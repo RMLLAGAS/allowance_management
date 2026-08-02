@@ -1853,12 +1853,15 @@ PRINT_HTML = """
 body{font-family:Arial,sans-serif; padding:24px; color:#0b1d3a;}
 h1{margin-bottom:0;} .sub{color:#666; margin-top:2px;}
 table{width:100%; border-collapse:collapse; margin-top:16px;}
-th,td{border:1px solid #ddd; padding:8px; font-size:13px; text-align:left;}
+th,td{border:1px solid #ddd; padding:8px; font-size:13px; text-align:left; vertical-align:top;}
 th{background:#eef3fb;}
 .pos{color:#16a34a; font-weight:700;} .neg{color:#e11d48; font-weight:700;}
 .summary{display:flex; gap:24px; margin:16px 0;}
 .summary div{border:1px solid #ddd; border-radius:8px; padding:10px 16px;}
-@media print{ .noprint{display:none;} }
+.receipt-thumb{max-width:110px; max-height:110px; width:auto; height:auto; object-fit:contain; border:1px solid #ddd; border-radius:6px; display:block;}
+.no-receipt{color:#999; font-style:italic; font-size:12px; white-space:nowrap;}
+tr{page-break-inside:avoid;}
+@media print{ .noprint{display:none;} tr{page-break-inside:avoid;} }
 </style></head>
 <body>
 <button class="noprint" onclick="window.print()" style="padding:10px 18px;border-radius:8px;border:none;background:#3b82f6;color:#fff;font-weight:700;margin-bottom:12px;">Print / Save as PDF</button>
@@ -1871,12 +1874,19 @@ th{background:#eef3fb;}
   <div>Total Savings<br><b>₱{{ '%.2f'|format(stats.total_savings) }}</b></div>
 </div>
 <table>
-<thead><tr><th>Date</th><th>Type</th><th>Category / Source</th><th>Notes</th><th>Amount</th></tr></thead>
+<thead><tr><th>Date</th><th>Type</th><th>Category / Source</th><th>Notes</th><th>Amount</th><th>Receipt</th></tr></thead>
 <tbody>
 {% for t in rows %}
 <tr>
   <td>{{ t.date }}</td><td>{{ t.type|capitalize }}</td><td>{{ t.category or '-' }}</td><td>{{ t.notes or '-' }}</td>
   <td class="{{ 'pos' if t.type=='allowance' else 'neg' }}">{{ '+' if t.type=='allowance' else '-' }}₱{{ '%.2f'|format(t.amount) }}</td>
+  <td>
+  {% if t.receipt %}
+    <img class="receipt-thumb" src="{{ t.receipt }}" alt="Receipt for transaction on {{ t.date }}">
+  {% else %}
+    <span class="no-receipt">No Receipt Attached</span>
+  {% endif %}
+  </td>
 </tr>
 {% endfor %}
 </tbody>
