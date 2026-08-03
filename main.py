@@ -68,7 +68,7 @@ app.config.update(
     MAX_CONTENT_LENGTH=15 * 1024 * 1024,
 )
 
-CATEGORIES = ["Food", "School", "Transportation", "Bills", "Shopping", "Entertainment", "Others"]
+CATEGORIES = ["Food", "Drinks", "School", "Transportation", "Bills", "Shopping", "Entertainment", "Others"]
 SOURCES_HINT = ["Parents", "Salary", "Allowance", "Gift", "Freelance", "Other"]
 
 # --- Email verification (Brevo HTTP API) ----------------------------------------------
