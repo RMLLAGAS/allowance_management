@@ -23,9 +23,26 @@
 import os
 import shutil
 import sqlite3
+import uuid as uuid_lib
 from datetime import datetime
 
 from flask import g
+
+# =====================================================================================
+# HYBRID OFFLINE/ONLINE SYNC — additive extension
+# =====================================================================================
+# Everything below this point (sync columns, sync_queue/sync_meta tables, the
+# *_active views, and the mark_*() helpers) is NEW and purely additive:
+#   - No existing table, column, row, or index is ever dropped/renamed/altered
+#     destructively — only ALTER TABLE ... ADD COLUMN (guarded, like the rest of
+#     this file) and CREATE TABLE/VIEW IF NOT EXISTS.
+#   - Existing hard-DELETEs on transactions are replaced by callers with
+#     mark_deleted() (soft delete) — see the main.py patch notes. The row is
+#     never actually removed, so old behavior (row disappears from the UI) is
+#     preserved via the *_active views, while the data survives for sync.
+# This lets sync.py / cloud.py / network.py / api.py be added as new files
+# without touching the core schema/backup logic above.
+SYNCED_TABLES = ("users", "transactions", "savings_goals")
 
 # =====================================================================================
 # FOLDER LAYOUT
@@ -212,6 +229,90 @@ def init_db():
     if "receipt" not in existing_tx_cols:
         c.execute("ALTER TABLE transactions ADD COLUMN receipt TEXT")
 
+    # ---------------------------------------------------------------------------
+    # SYNC COLUMNS — additive, guarded exactly like every other migration above.
+    # uuid           stable identity shared with Supabase (never the local
+    #                autoincrement id, which is only unique per-device)
+    # updated_at     last-write timestamp, used for last-write-wins conflicts
+    # deleted_at     soft-delete marker (NULL = active); transactions/savings_goals
+    #                are never hard-deleted once sync is enabled
+    # sync_status    'pending' (needs push) | 'synced' | 'conflict'
+    # device_id      which device made the most recent change
+    # version        monotonically incremented on every local write
+    # ---------------------------------------------------------------------------
+    SYNC_COLUMNS = [
+        ("uuid",        "TEXT"),
+        ("updated_at",  "TEXT"),
+        ("deleted_at",  "TEXT"),
+        ("sync_status", "TEXT DEFAULT 'pending'"),
+        ("device_id",   "TEXT"),
+        ("version",     "INTEGER DEFAULT 1"),
+    ]
+    for table in SYNCED_TABLES:
+        existing_cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+        for col_name, col_def in SYNC_COLUMNS:
+            if col_name not in existing_cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+        # Every row needs a UNIQUE uuid so it can be upserted into Supabase without
+        # duplicating. A plain UNIQUE index (not a column constraint) can be added
+        # after the fact and is a no-op if it already exists.
+        c.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)")
+
+    # One-time backfill: any pre-existing rows (created before sync existed) get a
+    # uuid/updated_at/version now, so they become eligible to push on first sync.
+    # This UPDATE only ever fills in NULLs — it never touches a row that already
+    # has sync metadata, and it never touches any non-sync column.
+    now_iso = datetime.now().isoformat()
+    for table in SYNCED_TABLES:
+        rows_needing_uuid = c.execute(f"SELECT id FROM {table} WHERE uuid IS NULL").fetchall()
+        for (row_id,) in rows_needing_uuid:
+            c.execute(
+                f"UPDATE {table} SET uuid=?, updated_at=COALESCE(updated_at, ?), "
+                f"version=COALESCE(version, 1), sync_status='pending' WHERE id=?",
+                (str(uuid_lib.uuid4()), now_iso, row_id)
+            )
+
+    # sync_queue: a durable retry log for pushes that failed (network blip, server
+    # 5xx, etc.) so nothing is silently dropped — sync.py drains this on every sync.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sync_queue (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name    TEXT NOT NULL,
+            record_uuid   TEXT NOT NULL,
+            operation     TEXT NOT NULL CHECK(operation IN ('upsert','delete')),
+            attempts      INTEGER DEFAULT 0,
+            last_error    TEXT,
+            next_retry_at TEXT,
+            created_at    TEXT NOT NULL
+        )
+    """)
+
+    # sync_meta: small persistent key/value store — this device's id, and the
+    # last-successful-pull timestamp per table (so pulls only fetch what changed).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sync_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    c.execute("SELECT value FROM sync_meta WHERE key='device_id'")
+    if c.fetchone() is None:
+        c.execute("INSERT INTO sync_meta (key, value) VALUES ('device_id', ?)",
+                   (str(uuid_lib.uuid4()),))
+
+    # *_active views: every existing SELECT elsewhere in the app that reads
+    # "FROM transactions" / "FROM savings_goals" only needs its FROM-clause table
+    # name swapped to the matching *_active view to automatically stop showing
+    # soft-deleted rows — no WHERE-clause surgery needed at every call site.
+    c.execute("""
+        CREATE VIEW IF NOT EXISTS transactions_active AS
+        SELECT * FROM transactions WHERE deleted_at IS NULL
+    """)
+    c.execute("""
+        CREATE VIEW IF NOT EXISTS savings_goals_active AS
+        SELECT * FROM savings_goals WHERE deleted_at IS NULL
+    """)
+
     conn.commit()
     conn.close()
 
@@ -267,3 +368,96 @@ def save_file(directory, filename, raw_bytes):
     with open(dest, "wb") as f:
         f.write(raw_bytes)
     return dest
+
+
+# =====================================================================================
+# SYNC HELPERS — call these from main.py right after an INSERT/UPDATE/soft-DELETE
+# on a synced table (users/transactions/savings_goals). They only ever touch the
+# six sync columns added above; they never modify business data.
+# =====================================================================================
+def get_device_id():
+    """This installation's stable device id (generated once, stored in sync_meta)."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT value FROM sync_meta WHERE key='device_id'").fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_sync_meta(key, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT value FROM sync_meta WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_sync_meta(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO sync_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_created(db, table, row_id):
+    """Call once, right after INSERT (same connection, before commit is fine —
+    it just needs the row to already exist). Stamps a fresh uuid/version/status
+    and enqueues the record for push on the next sync cycle."""
+    row_uuid = str(uuid_lib.uuid4())
+    db.execute(
+        f"UPDATE {table} SET uuid=?, updated_at=?, version=1, "
+        f"sync_status='pending', device_id=? WHERE id=?",
+        (row_uuid, datetime.now().isoformat(), get_device_id(), row_id)
+    )
+    _enqueue(db, table, row_uuid, "upsert")
+    return row_uuid
+
+
+def mark_updated(db, table, row_id):
+    """Call after any UPDATE that changes user-visible data on a synced table."""
+    row = db.execute(f"SELECT uuid, version FROM {table} WHERE id=?", (row_id,)).fetchone()
+    if row is None:
+        return
+    row_uuid = row["uuid"] or str(uuid_lib.uuid4())
+    next_version = (row["version"] or 1) + 1
+    db.execute(
+        f"UPDATE {table} SET uuid=?, updated_at=?, version=?, "
+        f"sync_status='pending', device_id=? WHERE id=?",
+        (row_uuid, datetime.now().isoformat(), next_version, get_device_id(), row_id)
+    )
+    _enqueue(db, table, row_uuid, "upsert")
+
+
+def mark_deleted(db, table, row_id):
+    """Soft delete: sets deleted_at instead of removing the row. The row drops
+    out of *_active views immediately (identical UX to the old hard DELETE) but
+    survives on disk so the deletion can be propagated to other devices."""
+    row = db.execute(f"SELECT uuid, version FROM {table} WHERE id=?", (row_id,)).fetchone()
+    if row is None:
+        return
+    row_uuid = row["uuid"] or str(uuid_lib.uuid4())
+    next_version = (row["version"] or 1) + 1
+    now = datetime.now().isoformat()
+    db.execute(
+        f"UPDATE {table} SET uuid=?, updated_at=?, deleted_at=?, version=?, "
+        f"sync_status='pending', device_id=? WHERE id=?",
+        (row_uuid, now, now, next_version, get_device_id(), row_id)
+    )
+    _enqueue(db, table, row_uuid, "delete")
+
+
+def _enqueue(db, table, row_uuid, operation):
+    """Add/refresh a sync_queue entry for this record. sync.py drains this queue;
+    a record that changes again before it's pushed just gets a fresh queue row
+    rather than piling up duplicates."""
+    db.execute(
+        "DELETE FROM sync_queue WHERE table_name=? AND record_uuid=?",
+        (table, row_uuid)
+    )
+    db.execute(
+        "INSERT INTO sync_queue (table_name, record_uuid, operation, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (table, row_uuid, operation, datetime.now().isoformat())
+    )
