@@ -31,6 +31,8 @@ from flask import (
 from jinja2 import DictLoader
 from werkzeug.security import generate_password_hash, check_password_hash
 
+import database  # all persistence (DB file, schema, folders, backups) lives here now
+
 # Load variables from a local .env file (if present) into os.environ BEFORE
 # anything below reads them with os.environ.get(). Without this, EMAIL_ADDRESS /
 # EMAIL_APP_PASSWORD / SECRET_KEY / DB_PATH in your .env are silently ignored —
@@ -52,9 +54,6 @@ APP_VERSION  = "1.5.1"
 DEVELOPER    = "RM LLAGAS"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# On Render, set DB_PATH to a location on your mounted persistent disk (e.g. /var/data/allowance.db)
-# so the database survives redeploys. Without it, the DB resets on every deploy.
-DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "allowance.db"))
 
 app = Flask(__name__)
 # On Render, set a SECRET_KEY environment variable so sessions survive restarts/redeploys.
@@ -95,127 +94,18 @@ LOCKOUT_MINUTES = 15
 
 
 # =====================================================================================
-# SECTION 3 — DATABASE LAYER (SQLite)
+# SECTION 3 — DATABASE LAYER
 # =====================================================================================
-def get_db():
-    """Return a request-scoped SQLite connection."""
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(exception=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
-    """Create all required tables (idempotent) with proper foreign keys."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name             TEXT NOT NULL,
-            username              TEXT NOT NULL UNIQUE,
-            password_hash         TEXT NOT NULL,
-            profile_pic           TEXT,
-            cover_photo           TEXT,
-            email                 TEXT UNIQUE,
-            email_verified        INTEGER DEFAULT 0,
-            verification_code     TEXT,
-            verification_expiry   TEXT,
-            date_joined           TEXT NOT NULL,
-            last_login             TEXT,
-            monthly_budget        REAL DEFAULT 0,
-            weekly_budget         REAL DEFAULT 0,
-            daily_budget          REAL DEFAULT 0,
-            yearly_budget         REAL DEFAULT 0,
-            theme                 TEXT DEFAULT 'blue',
-            notifications_enabled INTEGER DEFAULT 1,
-            budget_alerts         INTEGER DEFAULT 1,
-            savings_alerts        INTEGER DEFAULT 1,
-            session_timeout       INTEGER DEFAULT 30
-        )
-    """)
-
-    # --- Safe migration: add yearly_budget to existing installs that predate it ---
-    # (Existing monthly_budget / weekly_budget / daily_budget columns and data are untouched.)
-    existing_user_cols = [r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()]
-    if "yearly_budget" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN yearly_budget REAL DEFAULT 0")
-
-    # --- Safe migration: add cover_photo + email verification columns for existing installs ---
-    # cover_photo is stored the same way as profile_pic: a base64 data-URI string directly
-    # in SQLite. No separate uploads folder, and the old background-video system (which used
-    # to store bg_video_filename here) has been removed entirely.
-    if "cover_photo" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN cover_photo TEXT")
-    if "email" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN email TEXT")
-    if "email_verified" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0")
-    if "verification_code" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
-    if "verification_expiry" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN verification_expiry TEXT")
-    if "bio" not in existing_user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN bio TEXT")
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS savings_goals (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id       INTEGER NOT NULL,
-            goal_name     TEXT NOT NULL,
-            goal_amount   REAL NOT NULL,
-            current_saved REAL DEFAULT 0,
-            deadline      TEXT,
-            created_at    TEXT NOT NULL,
-            status        TEXT DEFAULT 'active',
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL,
-            type        TEXT NOT NULL CHECK(type IN ('allowance','expense','savings')),
-            amount      REAL NOT NULL CHECK(amount > 0),
-            category    TEXT,
-            date        TEXT NOT NULL,
-            notes       TEXT,
-            receipt     TEXT,
-            recurring   TEXT DEFAULT 'none',
-            goal_id     INTEGER,
-            created_at  TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-            FOREIGN KEY (goal_id) REFERENCES savings_goals (id) ON DELETE SET NULL
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS login_attempts (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            username     TEXT NOT NULL,
-            attempt_time TEXT NOT NULL,
-            success      INTEGER NOT NULL
-        )
-    """)
-
-    # --- Safe migration: add receipt column to existing transactions tables ---
-    existing_tx_cols = [r[1] for r in c.execute("PRAGMA table_info(transactions)").fetchall()]
-    if "receipt" not in existing_tx_cols:
-        c.execute("ALTER TABLE transactions ADD COLUMN receipt TEXT")
-
-    conn.commit()
-    conn.close()
+# All persistence — the SQLite connection, schema/migrations, the data/ + exports/
+# folder layout, and automatic backups — now lives in database.py, completely
+# separate from this file. main.py can be replaced/redeployed at any time without
+# ever touching allowance.db or anything under data/ or exports/.
+#
+# These names are kept so every existing get_db() / DB_PATH reference below keeps
+# working unchanged.
+get_db  = database.get_db
+DB_PATH = database.DB_PATH
+app.teardown_appcontext(database.close_db)
 
 
 # =====================================================================================
@@ -342,12 +232,18 @@ def parse_date(raw):
 
 
 def encode_upload(file_storage, max_bytes=10 * 1024 * 1024,
-                  allowed=("png", "jpg", "jpeg", "gif", "webp", "heic")):
+                  allowed=("png", "jpg", "jpeg", "gif", "webp", "heic"),
+                  save_dir=None, save_prefix="file"):
     """Validate + base64-encode an uploaded image so it can live inside SQLite (no static/ folder).
 
     Supports JPG, JPEG, PNG, WEBP, GIF, and HEIC (iPhone).
     HEIC images are automatically converted to JPEG using ImageMagick (wand).
     Maximum raw upload size is 10 MB.
+
+    If save_dir is given (database.RECEIPTS_DIR or database.PROFILE_DIR), the same
+    bytes are also written there as a permanent on-disk copy. This is purely an
+    additional physical backup — the app always renders from the base64 value
+    returned here / stored in the database, so this never changes any behavior.
     """
     if not file_storage or not file_storage.filename:
         return None
@@ -376,6 +272,14 @@ def encode_upload(file_storage, max_bytes=10 * 1024 * 1024,
     mime_map = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png",
                 "gif": "gif", "webp": "webp"}
     mime = "image/" + mime_map.get(ext, ext)
+
+    if save_dir:
+        try:
+            fname = f"{save_prefix}_{secrets.token_hex(8)}.{ext}"
+            database.save_file(save_dir, fname, data)
+        except OSError:
+            pass  # a disk-write hiccup should never break the upload itself
+
     return f"data:{mime};base64,{_base64.b64encode(data).decode('utf-8')}"
 
 
@@ -2407,7 +2311,8 @@ def add_expense():
         receipt_file = request.files.get("receipt")
         receipt = None
         if receipt_file and receipt_file.filename:
-            receipt = encode_upload(receipt_file)
+            receipt = encode_upload(receipt_file, save_dir=database.RECEIPTS_DIR,
+                                     save_prefix=f"receipt_u{session['user_id']}")
             if receipt is None:
                 # File was provided but rejected — tell the user why
                 ext = receipt_file.filename.rsplit(".", 1)[-1].lower() if "." in receipt_file.filename else ""
@@ -2519,6 +2424,15 @@ def export_csv():
     for t in rows:
         writer.writerow([t["date"], t["type"], t["category"] or "", t["notes"] or "", f"{t['amount']:.2f}"])
     output = buf.getvalue()
+
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        database.save_file(database.EXPORTS_EXCEL_DIR,
+                            f"transactions_u{session['user_id']}_{stamp}.csv",
+                            output.encode("utf-8"))
+    except OSError:
+        pass  # saving the archive copy should never block the actual download
+
     return Response(output, mimetype="text/csv",
                      headers={"Content-Disposition": "attachment; filename=transactions_export.csv"})
 
@@ -2529,7 +2443,22 @@ def export_print():
     db = get_db()
     rows = db.execute("SELECT * FROM transactions WHERE user_id=? ORDER BY date DESC", (session["user_id"],)).fetchall()
     stats = get_stats(session["user_id"])
-    return render_template("print.html", rows=rows, stats=stats, now=datetime.now().strftime("%Y-%m-%d %H:%M"))
+    html = render_template("print.html", rows=rows, stats=stats, now=datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+    # This "PDF export" is the browser's own print-to-PDF on this page (there's no
+    # server-side PDF library in this app), so what we can permanently archive here
+    # is the exact HTML that was rendered — saved into exports/pdf/ alongside a
+    # timestamp, for the record, even though the user's actual PDF is produced by
+    # their browser and never passes through this server.
+    try:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        database.save_file(database.EXPORTS_PDF_DIR,
+                            f"transactions_u{session['user_id']}_{stamp}.html",
+                            html.encode("utf-8"))
+    except OSError:
+        pass  # saving the archive copy should never block the actual export
+
+    return html
 
 
 # =====================================================================================
@@ -2669,7 +2598,8 @@ def update_picture():
         flash("Profile picture removed.", "info")
         return redirect(url_for("settings"))
 
-    encoded = encode_upload(request.files.get("profile_pic"))
+    encoded = encode_upload(request.files.get("profile_pic"), save_dir=database.PROFILE_DIR,
+                             save_prefix=f"profile_u{session['user_id']}")
     if not encoded:
         flash("Please upload a valid image (png/jpg/jpeg/gif/webp, max 4MB).", "danger")
         return redirect(url_for("settings"))
@@ -2690,7 +2620,8 @@ def update_cover_photo():
         flash("Cover photo removed.", "info")
         return redirect(url_for("settings"))
 
-    encoded = encode_upload(request.files.get("cover_photo"))
+    encoded = encode_upload(request.files.get("cover_photo"), save_dir=database.PROFILE_DIR,
+                             save_prefix=f"cover_u{session['user_id']}")
     if not encoded:
         flash("Please upload a valid image (png/jpg/jpeg/gif/webp, max 4MB).", "danger")
         return redirect(url_for("settings"))
@@ -2788,13 +2719,22 @@ def too_large(e):
 # =====================================================================================
 # SECTION 17 — ENTRY POINT
 # =====================================================================================
-# init_db() runs at import time (not just under __main__) so it also executes when
-# gunicorn imports this file on Render, e.g. `gunicorn main:app`.
-init_db()
+# database.init_db() runs at import time (not just under __main__) so it also
+# executes when gunicorn imports this file on Render, e.g. `gunicorn main:app`.
+# It connects to the existing allowance.db if one is already there (migrating it
+# from the old next-to-main.py location on first run if needed), only ever adds
+# missing tables/columns, and takes an automatic backup snapshot — it never
+# deletes, overwrites, or recreates your data.
+database.init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"\n  {APP_NAME} — {APP_TAGLINE}")
     print(f"  Database ready at: {DB_PATH}")
+    print(f"  Receipts folder:   {database.RECEIPTS_DIR}")
+    print(f"  Profile folder:    {database.PROFILE_DIR}")
+    print(f"  Backups folder:    {database.BACKUPS_DIR}")
+    print(f"  PDF exports:       {database.EXPORTS_PDF_DIR}")
+    print(f"  Excel exports:     {database.EXPORTS_EXCEL_DIR}")
     print(f"  Starting server on http://127.0.0.1:{port}  (Ctrl+C to stop)\n")
     app.run(host="0.0.0.0", port=port, debug=False)
