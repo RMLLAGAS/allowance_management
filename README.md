@@ -1,105 +1,113 @@
-# Allowance Management — Smart Personal Finance Manager
+# Hybrid Offline + Online Sync — Implementation Guide
 
-Single-file Flask + SQLite personal finance app (Pydroid 3 compatible).
-Everything — backend, HTML, CSS, JS, and the database layer — lives in `main.py`.
+## Files in this drop
 
-## Features
+| File | Status | Purpose |
+|---|---|---|
+| `database.py` | **modified copy** — additive only | sync columns, `sync_queue`/`sync_meta` tables, `*_active` views, `mark_created/updated/deleted()` helpers |
+| `network.py` | new | cached internet connectivity check |
+| `cloud.py` | new | Supabase (PostgREST) client — push/pull, credential handling |
+| `sync.py` | new | the sync engine: push, pull, conflict resolution, retry queue, background loop, status |
+| `api.py` | new | Flask Blueprint — `/sync/status`, `/sync/manual` |
+| `supabase_schema.sql` | new | run once in the Supabase SQL editor |
+| `MAIN_PY_INTEGRATION.md` | new | the exact ~21 line-level additions your `main.py` needs |
 
-- Register / Login with email verification (6-digit code, Gmail SMTP, 10-minute expiry)
-- Login is blocked until the user's email is verified
-- Dashboard Welcome Card with a **Cover Photo background** (no video — removed for
-  speed/stability on mobile), dark overlay for text readability, smooth fade-in
-- Separate **Profile Photo** and **Cover Photo** upload/remove in Settings
-  (both stored as Base64 strings directly in SQLite — no uploads folder)
-- Allowance / Expense tracking, Budgets, Savings Goals, Reports, CSV/Print export
-- Modern blue glassmorphism UI, mobile responsive
+`main.py` itself is **not** included/rewritten — everything it needs is a small,
+mechanical addition, listed precisely in `MAIN_PY_INTEGRATION.md`, so you can apply
+it to your real file yourself (or hand that file + your `main.py` to Claude Code to
+apply automatically).
 
-## Requirements
+## Step-by-step implementation plan
 
-- Python 3.9+
-- `pip install -r requirements.txt`
+1. Create a Supabase project (free tier is enough to start). Copy the Project URL
+   and the **service_role** key from Settings → API.
+2. Run `supabase_schema.sql` in the Supabase SQL Editor.
+3. Drop `network.py`, `cloud.py`, `sync.py`, `api.py` next to your `main.py`/`database.py`.
+4. Replace your `database.py` with the modified copy here (diff it first if you've
+   changed it since this upload — the sync additions are all appended near the
+   bottom / inside `init_db()`, so a manual merge is straightforward).
+5. Apply the 21 edits in `MAIN_PY_INTEGRATION.md`.
+6. `pip install requests` (and `cryptography` if you want the optional encrypted
+   local credential store instead of env vars).
+7. Add `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` to `.env` (local) or your host's
+   environment variables (Render, etc.).
+8. Run the app. On first startup with credentials configured, the background
+   scheduler fires an initial sync; every pre-existing local row gets backfilled
+   with a `uuid` (done automatically inside `init_db()`) and pushed up.
+9. Turn off your network and confirm the app still works exactly as before — that's
+   the whole point: **sync is additive, offline is unchanged.**
 
-## Local Setup
+## How each requirement is met
 
-```bash
-git clone <your-repo-url>
-cd <repo>
-pip install -r requirements.txt
-cp .env.example .env   # then edit .env with your real values
-python main.py
-```
+**Offline mode** — untouched. Every route still reads/writes SQLite directly through
+`get_db()`, exactly as today. `sync.py` is only ever invoked by `trigger_async_sync()`
+(login/logout, fire-and-forget in a background thread) or the 5-minute loop — never
+inline in a request path, so a slow/dead network can never make a page hang.
 
-The app starts on `http://127.0.0.1:5000` (or the `PORT` you set).
-The SQLite database (`allowance.db` by default) is created automatically on
-first run.
+**Online mode / automatic sync** — `sync.start_background_scheduler()` runs
+`full_sync()` on startup and every 5 minutes; `trigger_async_sync()` runs it on login
+and logout too. The manual "Sync Now" badge hits `POST /sync/manual`.
 
-## Environment Variables
+**Conflict handling** — `version` (monotonic per-record counter) is the primary
+ordering signal, `updated_at` breaks ties; see the block comment at the top of
+`sync.py`. A soft delete is just a write like any other, so the same rule decides
+whether a delete or a later edit wins.
 
-See `.env.example` for the full list. The important ones:
+**Never duplicate records** — every table's cloud primary key is `uuid`
+(`unique`), and pushes use `on_conflict=uuid` (Postgres `UPSERT`), so re-pushing the
+same record is always idempotent. Locally, `idx_<table>_uuid` is a `UNIQUE INDEX`.
 
-| Variable             | Purpose                                                        |
-|-----------------------|------------------------------------------------------------------|
-| `SECRET_KEY`          | Flask session secret. Set this in production.                   |
-| `DB_PATH`             | Path to the SQLite file. On Render, point this at a persistent disk. |
-| `SMTP_SERVER` / `SMTP_PORT` | Gmail SMTP host/port (defaults: `smtp.gmail.com` / `587`). |
-| `EMAIL_ADDRESS`       | Gmail address used to send verification codes.                  |
-| `EMAIL_APP_PASSWORD`  | Gmail **App Password** (not your normal password) — [create one here](https://myaccount.google.com/apppasswords). |
+**Soft deletes** — `mark_deleted()` sets `deleted_at`/bumps `version` instead of
+`DELETE`ing. The `transactions_active` / `savings_goals_active` views make every
+existing read query ignore soft-deleted rows automatically — same UI behavior, data
+never destroyed.
 
-If `EMAIL_ADDRESS` / `EMAIL_APP_PASSWORD` are left blank, registration still
-works and a code is generated and stored, but no email is actually sent
-(useful for local/offline testing).
+**Internet detection** — `network.is_online()`, a cached raw-socket probe against
+Google/Cloudflare DNS (fast, no dependency on Supabase being up specifically).
 
-## Deploying to Render
+**Background sync** — daemon thread started once at import time; also fired on
+login/logout as one-off background threads so they never block those requests.
 
-1. Push this repo to GitHub.
-2. Create a new **Web Service** on Render, connect the repo.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `gunicorn main:app` (already set in the `Procfile`).
-5. Add a **Persistent Disk** (e.g. mounted at `/var/data`) so the SQLite
-   database survives redeploys, then set `DB_PATH=/var/data/allowance.db`.
-6. Add the environment variables listed above (`SECRET_KEY`, `EMAIL_ADDRESS`,
-   `EMAIL_APP_PASSWORD`, etc.) in the Render dashboard.
+**Sync status UI** — `GET /sync/status` returns one of 🟢/🔴/🔄/✅/⚠ plus a pending
+count; `MAIN_PY_INTEGRATION.md` §19 wires this into the existing top bar with a
+20-second poll and a tap-to-sync button — no new template needed.
 
-Without a persistent disk, Render's filesystem is ephemeral and the database
-resets on every deploy.
+**Backup before sync** — `sync.full_sync()` calls `database.backup_db()` (your
+existing, already-safe `shutil.copy2` snapshot function) as its first step, every
+time, before touching anything.
 
-## Project Structure
+**Security** — credentials come from environment variables only (`SUPABASE_URL`,
+`SUPABASE_SERVICE_KEY`); Supabase's REST API is HTTPS-only by construction; RLS is
+enabled with no anon/authenticated policies, so only the server-side `service_role`
+key can reach the tables at all (see the note in `supabase_schema.sql`). An optional
+`cryptography`-based encrypted-at-rest fallback is included in `cloud.py` for hosts
+where env vars aren't convenient. `password_hash` is deliberately **not** synced —
+see the note at the bottom of `supabase_schema.sql`.
 
-```
-.
-├── main.py           # entire app: routes, DB layer, inline HTML templates
-├── requirements.txt
-├── Procfile           # gunicorn start command for Render/Heroku-style hosts
-├── .env.example        # copy to .env and fill in real values
-└── .gitignore
-```
+**Error handling** — every `cloud.py` call raises a single `CloudError` on any
+network/HTTP failure; `sync.py` catches it, requeues the affected records with
+linear backoff (`RETRY_BACKOFF_SECONDS * attempts`, capped at `MAX_ATTEMPTS=8`), and
+reports `sync_state="failed"` without ever raising out of a request handler.
+Duplicate records are structurally prevented (see above), not just retried around.
+A partial push/pull (some tables succeed, one fails) is safe because each table is
+processed and committed independently inside the same `full_sync()` call.
 
-## Troubleshooting: Verification Email Not Sending
+**Performance** — pushes only ever send rows sitting in `sync_queue` (changed since
+last sync); pulls filter server-side with `updated_at=gt.<since>` so only new
+remote changes are downloaded. The full table is never transferred in either
+direction.
 
-1. **Make sure you copied `.env.example` to `.env`** and filled in real values —
-   the app loads `.env` automatically via `python-dotenv` (included in
-   `requirements.txt`). If `python-dotenv` isn't installed, `.env` is silently
-   skipped, so run `pip install -r requirements.txt` again if unsure.
-2. **`EMAIL_APP_PASSWORD` must be a Gmail App Password**, not your normal
-   Gmail login password. Generate one at
-   <https://myaccount.google.com/apppasswords> (requires 2-Step Verification
-   to be enabled on the Google account first).
-3. **Check the server console/terminal** where `python main.py` is running —
-   on failure it prints the real reason, e.g. `[email] Failed to send
-   verification email to ...: (535, b'5.7.8 Username and Password not
-   accepted...')`, which almost always means the app password is wrong or
-   2-Step Verification isn't enabled.
-4. If `EMAIL_ADDRESS` / `EMAIL_APP_PASSWORD` are left blank, the app still
-   generates and stores a verification code (visible in the `users` table)
-   but intentionally does not attempt to send anything — useful for local
-   testing without a real Gmail account.
-5. On Render/other hosts, set `EMAIL_ADDRESS` and `EMAIL_APP_PASSWORD` as
-   actual environment variables in the dashboard (there's no `.env` file
-   there — the platform injects them directly).
+**Project structure** — only `network.py`, `cloud.py`, `sync.py`, `api.py` are new
+top-level modules, exactly as requested; every other file is either untouched or
+additively patched.
 
-## Notes
+## What's intentionally out of scope here (call these out if you want them added)
 
-- No separate `uploads/` folder — profile and cover photos are stored as
-  Base64 data URIs directly in the `users` table.
-- The old video-background feature has been fully removed (no
-  `bg_video_filename` column, no video streaming route).
+- Real per-end-user Supabase Auth (currently the Flask server is the sole client,
+  using one shared `service_role` key — fine for a single-deployment app, but if you
+  ever expose Supabase directly to a mobile client you'd want per-user JWTs + RLS
+  policies keyed on `auth.uid()` instead of the current server-only lockdown).
+- Syncing receipt/profile-photo *binary bytes* to Supabase Storage — right now those
+  stay device-local (only the DB row referencing them syncs). Straightforward to add
+  as a `storage.py` module following the same push/pull pattern if you want images
+  to follow the user across devices too.
